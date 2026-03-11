@@ -1,0 +1,18 @@
+{
+  "name": "mis-mcp-server",
+  "version": "1.0.0",
+  "description": "MCP Server for MIS Content Repository",
+  "type": "module",
+  "main": "server.js",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.1",
+    "express": "^4.21.0",
+    "zod": "^3.23.0"
+  }
+}
