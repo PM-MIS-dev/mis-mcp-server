@@ -2,6 +2,7 @@ import crypto from "crypto";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import express from "express";
+import cors from "cors";
 import { z } from "zod";
 
 // ── Config ──
@@ -483,6 +484,13 @@ function createServer() {
 const app = express();
 const PORT = process.env.PORT || 5050;
 
+app.use(cors({
+  origin: true,
+  methods: ["GET", "POST", "DELETE", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Accept", "mcp-session-id", "Authorization"],
+  exposedHeaders: ["mcp-session-id"],
+  credentials: true,
+}));
 app.use(express.json());
 
 const transports = {};
