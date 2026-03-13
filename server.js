@@ -557,4 +557,15 @@ app.listen(PORT, () => {
   console.log(`MIS MCP Server v2.0.0 running on port ${PORT}`);
   console.log(`MCP endpoint: http://localhost:${PORT}/mcp`);
   console.log(`Health check: http://localhost:${PORT}/health`);
+
+  // Self-ping every 10 minutes to prevent Render free-tier cold starts
+  const SELF_URL = process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`;
+  setInterval(async () => {
+    try {
+      const res = await fetch(`${SELF_URL}/health`);
+      if (res.ok) console.log(`[keepalive] ping ok at ${new Date().toISOString()}`);
+    } catch (e) {
+      console.log(`[keepalive] ping failed: ${e.message}`);
+    }
+  }, 10 * 60 * 1000); // 10 minutes
 });
