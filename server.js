@@ -84,7 +84,7 @@ async function callEdgeFunction(question, { model, analyst_id } = {}) {
 function createServer() {
   const server = new McpServer({
     name: "MIS Content Repository",
-    version: "2.0.0",
+    version: "2.1.0",
   });
 
   // ── Tool: ask_question ──
@@ -136,9 +136,10 @@ function createServer() {
       query: z.string().describe("Search query — can be natural language (e.g. 'Intel foundry strategy', 'NVIDIA AI competitive moat')"),
       content_type: z.enum(ALL_CONTENT_TYPES).default("all").describe("Filter by content type: blog, research_note, research_paper, x_post, linkedin_post, press_citation, podcast, or all"),
       analyst: z.string().optional().describe("Filter by analyst name (e.g. 'Patrick Moorhead', 'Anshel Sag')"),
-      limit: z.number().min(1).max(50).default(10).describe("Number of results to return"),
+      limit: z.number().min(1).max(200).default(10).describe("Number of results to return (max 200)"),
+      offset: z.number().min(0).default(0).describe("Offset for pagination — skip this many results (use with limit to page through large result sets)"),
     },
-    async ({ query, content_type, analyst, limit }) => {
+    async ({ query, content_type, analyst, limit, offset }) => {
       try {
         const opts = {};
         if (analyst) {
@@ -154,7 +155,7 @@ function createServer() {
           sources = sources.filter((s) => s.content_type === content_type);
         }
 
-        sources = sources.slice(0, limit);
+        sources = sources.slice(offset, offset + limit);
 
         if (sources.length === 0) {
           return { content: [{ type: "text", text: "No results found." }] };
@@ -283,13 +284,14 @@ function createServer() {
       content_types: z.array(z.enum(ALL_CONTENT_TYPES.filter(t => t !== "all"))).optional().describe("Filter to specific content types (e.g. ['blog', 'research_note', 'podcast'] for long-form only)"),
       date_from: z.string().optional().describe("Only include content from this date onward (YYYY-MM-DD format)"),
       date_to: z.string().optional().describe("Only include content up to this date (YYYY-MM-DD format)"),
-      limit: z.number().min(1).max(100).default(25).describe("Maximum number of results (default 25)"),
+      limit: z.number().min(1).max(200).default(25).describe("Maximum number of results (default 25, max 200)"),
+      offset: z.number().min(0).default(0).describe("Offset for pagination — skip this many results (use with limit to page through large result sets)"),
     },
-    async ({ topic, analyst, content_types, date_from, date_to, limit }) => {
+    async ({ topic, analyst, content_types, date_from, date_to, limit, offset }) => {
       try {
         // Full-text search with filters, sorted chronologically
         const tsQuery = topic.split(/\s+/).filter(Boolean).join(" & ");
-        let queryParams = `select=id,title,body_text,content_type,source_url,published_date,analyst_id,word_count&order=published_date.desc&limit=${limit}`;
+        let queryParams = `select=id,title,body_text,content_type,source_url,published_date,analyst_id,word_count&order=published_date.desc&limit=${limit}&offset=${offset}`;
         queryParams += `&fts=fts.${encodeURIComponent(tsQuery)}`;
 
         if (analyst) {
@@ -354,11 +356,12 @@ function createServer() {
     "get_analyst_content",
     "Get recent content from a specific MIS analyst. Returns their latest posts, blogs, research, podcasts, and press citations with excerpts. Use get_full_content with item IDs to retrieve complete text.",
     {
-      analyst: z.string().describe("Analyst name (e.g. 'Patrick Moorhead', 'Matt Kimball', 'Anshel Sag', 'Jason Andersen', 'Melody Brue', 'Robert Kramer', 'Paul Smith-Goodson', 'Bill Curtis', 'Will Townsend')"),
+      analyst: z.string().describe("Analyst name (e.g. 'Patrick Moorhead', 'Matt Kimball', 'Anshel Sag', 'Jason Andersen', 'Melody Brue', 'Robert Kramer', 'Paul Smith-Goodson', 'Bill Curtis', 'Will Townsend', 'Moor Insights')"),
       content_type: z.enum(ALL_CONTENT_TYPES).default("all").describe("Filter by content type"),
-      limit: z.number().min(1).max(50).default(10).describe("Number of results"),
+      limit: z.number().min(1).max(200).default(10).describe("Number of results (max 200)"),
+      offset: z.number().min(0).default(0).describe("Offset for pagination — skip this many results (use with limit to page through all content)"),
     },
-    async ({ analyst, content_type, limit }) => {
+    async ({ analyst, content_type, limit, offset }) => {
       try {
         const aid = ANALYST_NAME_TO_ID[analyst.toLowerCase()];
         if (!aid) {
@@ -370,7 +373,7 @@ function createServer() {
           };
         }
 
-        let queryParams = `analyst_id=eq.${aid}&order=published_date.desc&limit=${limit}&select=id,title,body_text,content_type,source_url,published_date,word_count`;
+        let queryParams = `analyst_id=eq.${aid}&order=published_date.desc&limit=${limit}&offset=${offset}&select=id,title,body_text,content_type,source_url,published_date,word_count`;
         if (content_type && content_type !== "all") {
           queryParams += `&content_type=eq.${content_type}`;
         }
@@ -555,14 +558,14 @@ app.get("/health", (req, res) => {
   res.json({
     status: "ok",
     name: "MIS Content Repository MCP Server",
-    version: "2.0.0",
+    version: "2.1.0",
     tools: ["ask_question", "search_content", "get_full_content", "get_content_by_topic", "get_analyst_content", "get_stats", "get_analyst_stats"],
     sessions: Object.keys(transports).length,
   });
 });
 
 app.listen(PORT, () => {
-  console.log(`MIS MCP Server v2.0.0 running on port ${PORT}`);
+  console.log(`MIS MCP Server v2.1.0 running on port ${PORT}`);
   console.log(`MCP endpoint: http://localhost:${PORT}/mcp`);
   console.log(`Health check: http://localhost:${PORT}/health`);
 
