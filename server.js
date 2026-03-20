@@ -11,6 +11,148 @@ const SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZ
 const EDGE_FUNCTION_URL = `${SUPABASE_URL}/functions/v1/ask`;
 const ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InVoZHNodmt5Znh6d2FiaXBrcXR4Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzMxNjgwNDAsImV4cCI6MjA4ODc0NDA0MH0.tKwF_H1n5OqDEKLyFsLjF77B40nvwibOTBmThmaeZng";
 
+// ── Overload alert config ──
+const ALERT_EMAIL = process.env.ALERT_EMAIL || "phfmphfm@gmail.com";
+const ALERT_WEBHOOK = process.env.ALERT_WEBHOOK || ""; // Optional webhook URL
+const OVERLOAD_THRESHOLDS = {
+  maxConcurrentSessions: 20,     // Alert when this many sessions are active
+  maxRequestsPerMinute: 60,      // Alert when RPM exceeds this
+  maxErrorRatePercent: 25,       // Alert when error rate exceeds this %
+  maxAvgResponseTimeMs: 15000,   // Alert when avg response time exceeds 15s
+};
+const ALERT_COOLDOWN_MS = 30 * 60 * 1000; // Don't re-alert for 30 minutes
+let lastAlertTime = 0;
+
+// ── Session & metrics tracking ──
+const sessionMeta = {};  // sessionId -> { connectedAt, lastActive, requestCount, lastTool, userAgent, ip }
+const serverMetrics = {
+  startedAt: new Date().toISOString(),
+  totalRequests: 0,
+  totalErrors: 0,
+  toolCalls: {},         // toolName -> count
+  requestsLastMinute: [], // timestamps of recent requests
+  responseTimes: [],      // last 100 response times in ms
+};
+
+function trackRequest(sessionId, toolName, durationMs, isError = false) {
+  const now = Date.now();
+  serverMetrics.totalRequests++;
+  if (isError) serverMetrics.totalErrors++;
+
+  // Track tool usage
+  if (toolName) {
+    serverMetrics.toolCalls[toolName] = (serverMetrics.toolCalls[toolName] || 0) + 1;
+  }
+
+  // Track RPM (sliding window)
+  serverMetrics.requestsLastMinute.push(now);
+  serverMetrics.requestsLastMinute = serverMetrics.requestsLastMinute.filter(t => now - t < 60000);
+
+  // Track response times (keep last 100)
+  if (durationMs !== undefined) {
+    serverMetrics.responseTimes.push(durationMs);
+    if (serverMetrics.responseTimes.length > 100) serverMetrics.responseTimes.shift();
+  }
+
+  // Update session meta
+  if (sessionId && sessionMeta[sessionId]) {
+    sessionMeta[sessionId].lastActive = new Date().toISOString();
+    sessionMeta[sessionId].requestCount++;
+    if (toolName) sessionMeta[sessionId].lastTool = toolName;
+  }
+
+  // Check overload conditions
+  checkOverload();
+}
+
+function checkOverload() {
+  const now = Date.now();
+  if (now - lastAlertTime < ALERT_COOLDOWN_MS) return; // Respect cooldown
+
+  const activeSessions = Object.keys(transports).length;
+  const rpm = serverMetrics.requestsLastMinute.length;
+  const errorRate = serverMetrics.totalRequests > 0
+    ? (serverMetrics.totalErrors / serverMetrics.totalRequests) * 100
+    : 0;
+  const avgResponseTime = serverMetrics.responseTimes.length > 0
+    ? serverMetrics.responseTimes.reduce((a, b) => a + b, 0) / serverMetrics.responseTimes.length
+    : 0;
+
+  const alerts = [];
+  if (activeSessions >= OVERLOAD_THRESHOLDS.maxConcurrentSessions) {
+    alerts.push(`Sessions: ${activeSessions} (threshold: ${OVERLOAD_THRESHOLDS.maxConcurrentSessions})`);
+  }
+  if (rpm >= OVERLOAD_THRESHOLDS.maxRequestsPerMinute) {
+    alerts.push(`RPM: ${rpm} (threshold: ${OVERLOAD_THRESHOLDS.maxRequestsPerMinute})`);
+  }
+  if (errorRate >= OVERLOAD_THRESHOLDS.maxErrorRatePercent && serverMetrics.totalRequests > 10) {
+    alerts.push(`Error rate: ${errorRate.toFixed(1)}% (threshold: ${OVERLOAD_THRESHOLDS.maxErrorRatePercent}%)`);
+  }
+  if (avgResponseTime >= OVERLOAD_THRESHOLDS.maxAvgResponseTimeMs && serverMetrics.responseTimes.length > 5) {
+    alerts.push(`Avg response time: ${(avgResponseTime / 1000).toFixed(1)}s (threshold: ${(OVERLOAD_THRESHOLDS.maxAvgResponseTimeMs / 1000).toFixed(0)}s)`);
+  }
+
+  if (alerts.length > 0) {
+    lastAlertTime = now;
+    const message = `MIS MCP Server Overload Alert\n\n${alerts.join("\n")}\n\nActive sessions: ${activeSessions}\nRPM: ${rpm}\nUptime: ${getUptime()}\nTop tools: ${getTopTools(3)}`;
+    console.warn("[OVERLOAD ALERT]", message);
+    sendAlertEmail(message);
+  }
+}
+
+async function sendAlertEmail(message) {
+  // Log to Supabase alert_log table for persistence
+  try {
+    await fetch(`${SUPABASE_URL}/rest/v1/mcp_alerts`, {
+      method: "POST",
+      headers: {
+        apikey: SUPABASE_KEY,
+        Authorization: `Bearer ${SUPABASE_KEY}`,
+        "Content-Type": "application/json",
+        Prefer: "return=minimal",
+      },
+      body: JSON.stringify({
+        alert_type: "overload",
+        message,
+        active_sessions: Object.keys(transports).length,
+        rpm: serverMetrics.requestsLastMinute.length,
+        created_at: new Date().toISOString(),
+      }),
+    });
+  } catch (e) {
+    console.error("Failed to log alert to Supabase:", e.message);
+  }
+
+  // Webhook alert (if configured)
+  if (ALERT_WEBHOOK) {
+    try {
+      await fetch(ALERT_WEBHOOK, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text: message }),
+      });
+    } catch (e) {
+      console.error("Webhook alert failed:", e.message);
+    }
+  }
+}
+
+function getUptime() {
+  const started = new Date(serverMetrics.startedAt).getTime();
+  const diff = Date.now() - started;
+  const hours = Math.floor(diff / 3600000);
+  const mins = Math.floor((diff % 3600000) / 60000);
+  return `${hours}h ${mins}m`;
+}
+
+function getTopTools(n) {
+  return Object.entries(serverMetrics.toolCalls)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, n)
+    .map(([name, count]) => `${name}(${count})`)
+    .join(", ") || "none";
+}
+
 const ALL_CONTENT_TYPES = ["all", "blog", "research_note", "research_paper", "x_post", "linkedin_post", "press_citation", "podcast"];
 
 const ANALYST_MAP = {
@@ -499,13 +641,18 @@ app.use(express.json());
 const transports = {};
 
 app.post("/mcp", async (req, res) => {
+  const startTime = Date.now();
   try {
     const sessionId = req.headers["mcp-session-id"];
+    const userAgent = req.headers["user-agent"] || "unknown";
+    const clientIp = req.headers["x-forwarded-for"]?.split(",")[0]?.trim() || req.socket.remoteAddress || "unknown";
     let transport;
+    let isNewSession = false;
 
     if (sessionId && transports[sessionId]) {
       transport = transports[sessionId];
     } else {
+      isNewSession = true;
       const server = createServer();
       transport = new StreamableHTTPServerTransport({
         sessionIdGenerator: () => crypto.randomUUID(),
@@ -516,6 +663,7 @@ app.post("/mcp", async (req, res) => {
         const sid = transport.sessionId;
         if (sid && transports[sid]) {
           delete transports[sid];
+          delete sessionMeta[sid];
         }
       };
     }
@@ -525,13 +673,50 @@ app.post("/mcp", async (req, res) => {
     if (transport.sessionId && !transports[transport.sessionId]) {
       transports[transport.sessionId] = transport;
     }
+
+    // Track new session metadata
+    if (isNewSession && transport.sessionId) {
+      sessionMeta[transport.sessionId] = {
+        connectedAt: new Date().toISOString(),
+        lastActive: new Date().toISOString(),
+        requestCount: 1,
+        lastTool: null,
+        userAgent: parseUserAgent(userAgent),
+        ip: clientIp,
+      };
+    }
+
+    // Detect tool name from request body (MCP JSON-RPC)
+    let toolName = null;
+    if (req.body?.method === "tools/call" && req.body?.params?.name) {
+      toolName = req.body.params.name;
+    }
+
+    trackRequest(transport.sessionId, toolName, Date.now() - startTime);
+
   } catch (e) {
     console.error("MCP error:", e);
+    trackRequest(null, null, Date.now() - startTime, true);
     if (!res.headersSent) {
       res.status(500).json({ error: e.message });
     }
   }
 });
+
+function parseUserAgent(ua) {
+  if (!ua || ua === "unknown") return "Unknown";
+  if (ua.includes("Claude") || ua.includes("claude") || ua.includes("anthropic")) return "Claude.ai";
+  if (ua.includes("Cursor")) return "Cursor";
+  if (ua.includes("Windsurf")) return "Windsurf";
+  if (ua.includes("VSCode") || ua.includes("vscode")) return "VS Code";
+  if (ua.includes("Copilot")) return "GitHub Copilot";
+  if (ua.includes("Perplexity") || ua.includes("perplexity")) return "Perplexity";
+  if (ua.includes("OpenAI") || ua.includes("ChatGPT")) return "ChatGPT";
+  if (ua.includes("node-fetch") || ua.includes("Node")) return "Node.js Client";
+  if (ua.includes("Python") || ua.includes("python")) return "Python Client";
+  if (ua.includes("Mozilla") || ua.includes("Chrome") || ua.includes("Safari")) return "Browser";
+  return ua.substring(0, 50);
+}
 
 app.get("/mcp", async (req, res) => {
   const sessionId = req.headers["mcp-session-id"];
@@ -549,24 +734,102 @@ app.delete("/mcp", async (req, res) => {
     const transport = transports[sessionId];
     await transport.handleRequest(req, res);
     delete transports[sessionId];
+    delete sessionMeta[sessionId];
   } else {
     res.status(400).json({ error: "No session found." });
   }
 });
 
 app.get("/health", (req, res) => {
+  const activeSessions = Object.keys(transports).length;
+  const rpm = serverMetrics.requestsLastMinute.length;
+  const avgResponseTime = serverMetrics.responseTimes.length > 0
+    ? Math.round(serverMetrics.responseTimes.reduce((a, b) => a + b, 0) / serverMetrics.responseTimes.length)
+    : 0;
+  const errorRate = serverMetrics.totalRequests > 0
+    ? ((serverMetrics.totalErrors / serverMetrics.totalRequests) * 100).toFixed(1)
+    : "0.0";
+
   res.json({
     status: "ok",
     name: "MIS Content Repository MCP Server",
-    version: "2.1.0",
+    version: "2.2.0",
     tools: ["ask_question", "search_content", "get_full_content", "get_content_by_topic", "get_analyst_content", "get_stats", "get_analyst_stats"],
-    sessions: Object.keys(transports).length,
+    uptime: getUptime(),
+    sessions: {
+      active: activeSessions,
+      details: Object.entries(sessionMeta).map(([id, meta]) => ({
+        id: id.substring(0, 8) + "...",
+        client: meta.userAgent,
+        connected_at: meta.connectedAt,
+        last_active: meta.lastActive,
+        requests: meta.requestCount,
+        last_tool: meta.lastTool,
+        ip: meta.ip,
+      })),
+    },
+    metrics: {
+      total_requests: serverMetrics.totalRequests,
+      total_errors: serverMetrics.totalErrors,
+      error_rate: errorRate + "%",
+      requests_per_minute: rpm,
+      avg_response_time_ms: avgResponseTime,
+      tool_usage: serverMetrics.toolCalls,
+    },
+    thresholds: OVERLOAD_THRESHOLDS,
+  });
+});
+
+// ── Detailed metrics endpoint ──
+app.get("/metrics", (req, res) => {
+  const activeSessions = Object.keys(transports).length;
+  res.json({
+    server: {
+      version: "2.2.0",
+      started_at: serverMetrics.startedAt,
+      uptime: getUptime(),
+    },
+    sessions: {
+      active: activeSessions,
+      list: Object.entries(sessionMeta).map(([id, meta]) => ({
+        session_id: id.substring(0, 8) + "...",
+        client: meta.userAgent,
+        ip: meta.ip,
+        connected_at: meta.connectedAt,
+        last_active: meta.lastActive,
+        request_count: meta.requestCount,
+        last_tool_used: meta.lastTool,
+      })),
+    },
+    performance: {
+      total_requests: serverMetrics.totalRequests,
+      total_errors: serverMetrics.totalErrors,
+      error_rate_percent: serverMetrics.totalRequests > 0
+        ? ((serverMetrics.totalErrors / serverMetrics.totalRequests) * 100).toFixed(1)
+        : "0.0",
+      requests_per_minute: serverMetrics.requestsLastMinute.length,
+      avg_response_time_ms: serverMetrics.responseTimes.length > 0
+        ? Math.round(serverMetrics.responseTimes.reduce((a, b) => a + b, 0) / serverMetrics.responseTimes.length)
+        : 0,
+      p95_response_time_ms: serverMetrics.responseTimes.length > 0
+        ? Math.round(serverMetrics.responseTimes.slice().sort((a, b) => a - b)[Math.floor(serverMetrics.responseTimes.length * 0.95)])
+        : 0,
+    },
+    tool_usage: Object.entries(serverMetrics.toolCalls)
+      .sort((a, b) => b[1] - a[1])
+      .map(([name, count]) => ({ tool: name, calls: count })),
+    alert_config: {
+      thresholds: OVERLOAD_THRESHOLDS,
+      cooldown_minutes: ALERT_COOLDOWN_MS / 60000,
+      last_alert: lastAlertTime ? new Date(lastAlertTime).toISOString() : null,
+    },
   });
 });
 
 app.listen(PORT, () => {
-  console.log(`MIS MCP Server v2.1.0 running on port ${PORT}`);
+  console.log(`MIS MCP Server v2.2.0 running on port ${PORT}`);
   console.log(`MCP endpoint: http://localhost:${PORT}/mcp`);
   console.log(`Health check: http://localhost:${PORT}/health`);
-
+  console.log(`Metrics:      http://localhost:${PORT}/metrics`);
+  console.log(`Alert email:  ${ALERT_EMAIL}`);
 });
